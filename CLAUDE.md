@@ -48,7 +48,7 @@ Proposed based on tools already in use. Confirm before building on them.
 - **Database:** Supabase (Postgres) — clients, sessions, enquiries, deposits
 - **AI replies:** Anthropic Claude API — drafts replies in each artist's voice. The voice/tone is a **per-artist config field** (a tone profile + sample replies), never hardcoded, so onboarding a new artist is a settings change, not a code change.
 - **Bookings / calendar:** Google Calendar integration
-- **Deposits / payments:** Stripe
+- **Deposits / payments:** Personal Bank Transfer
 - **Social media:** Meta (Instagram/Facebook) Messaging API — HARD constraint, see below
 
 ## Hard Constraints (read before designing anything)

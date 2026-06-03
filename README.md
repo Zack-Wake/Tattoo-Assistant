@@ -4,7 +4,7 @@
 An inbound AI assistant for tattoo artists. It replies to people who message the artist first, books consultations for desgins, and sessions, and surfaces recoverable revenue the artist would otherwise lose.
 
 ## What it is
-A productised service (multi-tenant from day one). **Sean** is the pilot artist used to get the product right before onboarding others. Long-term: a multi-artist Saas that is posing as a productised service to increase profits, possibly other appointment-based trades later. In other words an AI assistant that handles Sean's Instagram/Messenger DMs — triages messages, qualifies booking inquiries, gathers what he needs (placement, style, references, photos), books consultation calls for design-stage customers, and lands prepped appointments in his calendar. Replaces a £320/month VA. Built on n8n + Claude API + Supabase.
+A productised service (multi-tenant from day one). **Sean** is the pilot artist used to get the product right before onboarding others. Long-term: a multi-artist Saas, possibly other appointment-based trades later. In other words an AI assistant that handles Sean's Instagram/Messenger DMs — triages messages, qualifies booking inquiries, gathers what he needs (placement, style, references, photos), books consultation calls for design-stage customers, and lands prepped appointments in his calendar. Replaces a £320/month VA. Built on Next.js + Claude API + Supabase.
 
 Sean is the first customer (test dummy + sorts Zack out on tattoos). If it works, he has hundreds of artist contacts to refer. Business model: productised service — deploy the same agent to multiple artists with per-artist config, charge setup fee + monthly retainer.
 
@@ -29,7 +29,7 @@ Replies are **inbound-only** and **drafted for the artist to approve** — the a
 - Database: Supabase (Postgres) + Row Level Security
 - AI replies: Anthropic Claude API (voice is per-artist config)
 - Calendar: Google Calendar
-- Payments / deposits: Stripe
+- Payments / deposits: Personal Bank Transfer
 - Social: Meta Instagram Graph API (official API only)
 
 ## Structure
