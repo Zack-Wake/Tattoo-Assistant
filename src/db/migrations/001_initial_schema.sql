@@ -1,5 +1,10 @@
--- Migration: 001_initial_schema
--- Multi-tenant tattoo studio assistant data model
+-- Migration: 001_initial_schema  (Packet 1 — multi-tenant data model)
+-- Produces the data SHAPE and security model only. No features, no UI, no payment logic.
+--
+-- Tenant identity: artist_id arrives via a JWT claim (app_metadata.artist_id), NOT
+-- Supabase Auth's auth.uid(). No login/signup UI is built here — that's deferred
+-- machinery (see packet-1.md "Out of scope"). Sean is issued a token carrying his
+-- artist_id directly (e.g. by setting his auth.users.raw_app_meta_data).
 
 -- ─────────────────────────────────────────────
 -- Enums
@@ -10,304 +15,219 @@ CREATE TYPE contact_category AS ENUM (
   'active_client',
   'unfinished_piece',
   'past_client',
-  'spam'
+  'spam_junk'
 );
 
-CREATE TYPE piece_status AS ENUM ('in_progress', 'complete', 'abandoned');
+CREATE TYPE piece_status AS ENUM ('in_progress', 'finished');
 
-CREATE TYPE session_status AS ENUM (
-  'pending',
-  'confirmed',
-  'completed',
-  'no_show',
-  'cancelled'
-);
-
-CREATE TYPE enquiry_source AS ENUM (
-  'instagram_dm',
-  'instagram_story_reply',
-  'instagram_comment',
-  'manual'
-);
-
-CREATE TYPE enquiry_status AS ENUM ('open', 'responded', 'converted', 'dropped');
-
-CREATE TYPE deposit_status AS ENUM ('pending', 'received', 'forfeited', 'refunded');
-
-CREATE TYPE message_direction AS ENUM ('inbound', 'outbound');
-
-CREATE TYPE reply_status AS ENUM ('none', 'drafted', 'approved', 'sent');
+CREATE TYPE appointment_status AS ENUM ('done', 'booked', 'no_show', 'cancelled');
 
 -- ─────────────────────────────────────────────
 -- Helpers
 -- ─────────────────────────────────────────────
 
+-- search_path is pinned on both functions to close the "search_path mutable"
+-- security lint (prevents search-path hijacking of unqualified references).
 CREATE OR REPLACE FUNCTION update_updated_at()
-RETURNS TRIGGER AS $$
+RETURNS TRIGGER
+LANGUAGE plpgsql
+SET search_path = ''
+AS $$
 BEGIN
   NEW.updated_at = NOW();
   RETURN NEW;
 END;
-$$ LANGUAGE plpgsql;
+$$;
+
+-- Reads the artist_id carried in the caller's JWT app_metadata claim.
+-- Returns NULL for service-role / unauthenticated contexts (RLS then denies all rows).
+CREATE OR REPLACE FUNCTION current_artist_id()
+RETURNS UUID
+LANGUAGE SQL STABLE
+SET search_path = ''
+AS $$
+  SELECT (auth.jwt() -> 'app_metadata' ->> 'artist_id')::uuid
+$$;
 
 -- ─────────────────────────────────────────────
--- artists — multi-tenant root
--- id = auth.uid() so RLS collapses to a single equality check
+-- artists — the tenant / config row. Voice is config, not code.
 -- ─────────────────────────────────────────────
 
 CREATE TABLE artists (
-  id                   UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
-  name                 TEXT        NOT NULL,
-  email                TEXT        UNIQUE NOT NULL,
-  instagram_account_id TEXT,
-  tone_profile         JSONB       NOT NULL DEFAULT '{}',
-  deposit_rules        JSONB       NOT NULL DEFAULT '{"amount_pence": 5000, "non_refundable": true}',
-  working_hours        JSONB       NOT NULL DEFAULT '{}',
-  created_at           TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-  updated_at           TIMESTAMPTZ NOT NULL DEFAULT NOW()
+  id                 UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
+  name               TEXT        NOT NULL,
+  voice_tone_profile JSONB       NOT NULL DEFAULT '{}',
+  working_hours      JSONB       NOT NULL DEFAULT '{}',
+  deposit_rules      JSONB       NOT NULL DEFAULT '{}',
+  created_at         TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
-CREATE TRIGGER artists_updated_at
-  BEFORE UPDATE ON artists
-  FOR EACH ROW EXECUTE FUNCTION update_updated_at();
+-- ─────────────────────────────────────────────
+-- blocklist — the do-not-engage boundary.
+-- Deliberately has NO foreign key to contacts: blocked people are dropped at
+-- ingestion, before any contact record exists. Enforcement happens in Packet 6;
+-- this table just needs to exist and be queryable now.
+-- ─────────────────────────────────────────────
 
--- Auto-create an artist row when a user signs up via Supabase Auth
-CREATE OR REPLACE FUNCTION handle_new_user()
-RETURNS TRIGGER AS $$
-BEGIN
-  INSERT INTO public.artists (id, name, email)
-  VALUES (
-    NEW.id,
-    COALESCE(NEW.raw_user_meta_data->>'name', split_part(COALESCE(NEW.email, ''), '@', 1)),
-    COALESCE(NEW.email, NEW.id::text)
-  )
-  ON CONFLICT (id) DO NOTHING;
-  RETURN NEW;
-END;
-$$ LANGUAGE plpgsql SECURITY DEFINER SET search_path = public;
+CREATE TABLE blocklist (
+  id         UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
+  artist_id  UUID        NOT NULL REFERENCES artists(id) ON DELETE CASCADE,
+  identifier TEXT        NOT NULL,
+  note       TEXT,
+  added_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
 
-CREATE TRIGGER on_auth_user_created
-  AFTER INSERT ON auth.users
-  FOR EACH ROW EXECUTE FUNCTION handle_new_user();
+CREATE INDEX idx_blocklist_artist ON blocklist(artist_id);
 
 -- ─────────────────────────────────────────────
--- contacts — people who message the artist
+-- contacts — people who have messaged. do_not_engage is NOT a category here
+-- (that's the blocklist above) — it's a separate concern entirely.
 -- ─────────────────────────────────────────────
 
 CREATE TABLE contacts (
-  id                UUID             PRIMARY KEY DEFAULT gen_random_uuid(),
-  artist_id         UUID             NOT NULL REFERENCES artists(id) ON DELETE CASCADE,
-  instagram_user_id TEXT,
-  name              TEXT,
-  phone             TEXT,
-  email             TEXT,
-  category          contact_category NOT NULL DEFAULT 'new_enquiry',
-  do_not_engage     BOOLEAN          NOT NULL DEFAULT FALSE,
-  notes             TEXT,
-  created_at        TIMESTAMPTZ      NOT NULL DEFAULT NOW(),
-  updated_at        TIMESTAMPTZ      NOT NULL DEFAULT NOW(),
-  UNIQUE (artist_id, instagram_user_id)
+  id              UUID             PRIMARY KEY DEFAULT gen_random_uuid(),
+  artist_id       UUID             NOT NULL REFERENCES artists(id) ON DELETE CASCADE,
+  name            TEXT             NOT NULL,
+  external_handle TEXT,
+  category        contact_category NOT NULL DEFAULT 'new_enquiry',
+  created_at      TIMESTAMPTZ      NOT NULL DEFAULT NOW(),
+  updated_at      TIMESTAMPTZ      NOT NULL DEFAULT NOW()
 );
 
 CREATE INDEX idx_contacts_artist   ON contacts(artist_id);
 CREATE INDEX idx_contacts_category ON contacts(artist_id, category);
--- Partial index used by the do-not-engage filter at ingestion
-CREATE INDEX idx_contacts_dne      ON contacts(artist_id) WHERE do_not_engage = FALSE;
 
 CREATE TRIGGER contacts_updated_at
   BEFORE UPDATE ON contacts
   FOR EACH ROW EXECUTE FUNCTION update_updated_at();
 
 -- ─────────────────────────────────────────────
--- pieces — tattoo pieces, drives multi-session tracking
+-- pieces — a tattoo project, possibly multi-session.
+-- whats_left is the artist's own notes box AND the unfinished signal — used only
+-- while in_progress. Packet 2 combines status='in_progress' with "no future
+-- appointment" as the strongest unfinished-piece signal (not whats_left alone).
 -- ─────────────────────────────────────────────
 
 CREATE TABLE pieces (
-  id               UUID         PRIMARY KEY DEFAULT gen_random_uuid(),
-  artist_id        UUID         NOT NULL REFERENCES artists(id) ON DELETE CASCADE,
-  contact_id       UUID         NOT NULL REFERENCES contacts(id) ON DELETE CASCADE,
-  title            TEXT,
-  description      TEXT,
-  is_multi_session BOOLEAN      NOT NULL DEFAULT FALSE,
-  status           piece_status NOT NULL DEFAULT 'in_progress',
-  created_at       TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
-  updated_at       TIMESTAMPTZ  NOT NULL DEFAULT NOW()
+  id          UUID         PRIMARY KEY DEFAULT gen_random_uuid(),
+  artist_id   UUID         NOT NULL REFERENCES artists(id) ON DELETE CASCADE,
+  contact_id  UUID         NOT NULL REFERENCES contacts(id) ON DELETE CASCADE,
+  description TEXT,
+  status      piece_status NOT NULL DEFAULT 'in_progress',
+  whats_left  TEXT,
+  created_at  TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+  updated_at  TIMESTAMPTZ  NOT NULL DEFAULT NOW()
 );
 
-CREATE INDEX idx_pieces_artist    ON pieces(artist_id);
-CREATE INDEX idx_pieces_contact   ON pieces(contact_id);
--- Partial index for the unfinished-pieces report query
-CREATE INDEX idx_pieces_unfinished ON pieces(artist_id)
-  WHERE status = 'in_progress' AND is_multi_session = TRUE;
+CREATE INDEX idx_pieces_artist          ON pieces(artist_id);
+CREATE INDEX idx_pieces_contact         ON pieces(contact_id);
+CREATE INDEX idx_pieces_in_progress     ON pieces(artist_id) WHERE status = 'in_progress';
 
 CREATE TRIGGER pieces_updated_at
   BEFORE UPDATE ON pieces
   FOR EACH ROW EXECUTE FUNCTION update_updated_at();
 
 -- ─────────────────────────────────────────────
--- sessions — bookings / appointments
+-- appointments — one list, past + future, filtered by status.
+-- Not split into separate past/future tables: easiest for the artist to work
+-- through, and Packet 5's no-show reporting wants the status anyway.
 -- ─────────────────────────────────────────────
 
-CREATE TABLE sessions (
-  id               UUID           PRIMARY KEY DEFAULT gen_random_uuid(),
-  artist_id        UUID           NOT NULL REFERENCES artists(id) ON DELETE CASCADE,
-  contact_id       UUID           NOT NULL REFERENCES contacts(id) ON DELETE CASCADE,
-  piece_id         UUID           REFERENCES pieces(id) ON DELETE SET NULL,
-  scheduled_at     TIMESTAMPTZ    NOT NULL,
-  duration_minutes INTEGER        NOT NULL DEFAULT 60,
-  status           session_status NOT NULL DEFAULT 'pending',
-  deposit_paid     BOOLEAN        NOT NULL DEFAULT FALSE,
-  notes            TEXT,
-  created_at       TIMESTAMPTZ    NOT NULL DEFAULT NOW(),
-  updated_at       TIMESTAMPTZ    NOT NULL DEFAULT NOW()
+CREATE TABLE appointments (
+  id           UUID               PRIMARY KEY DEFAULT gen_random_uuid(),
+  artist_id    UUID               NOT NULL REFERENCES artists(id) ON DELETE CASCADE,
+  contact_id   UUID               NOT NULL REFERENCES contacts(id) ON DELETE CASCADE,
+  piece_id     UUID               REFERENCES pieces(id) ON DELETE SET NULL,
+  status       appointment_status NOT NULL DEFAULT 'booked',
+  scheduled_at TIMESTAMPTZ        NOT NULL,
+  duration     INTERVAL,
+  created_at   TIMESTAMPTZ        NOT NULL DEFAULT NOW(),
+  updated_at   TIMESTAMPTZ        NOT NULL DEFAULT NOW()
 );
 
-CREATE INDEX idx_sessions_artist    ON sessions(artist_id);
-CREATE INDEX idx_sessions_contact   ON sessions(contact_id);
-CREATE INDEX idx_sessions_piece     ON sessions(piece_id);
-CREATE INDEX idx_sessions_scheduled ON sessions(artist_id, scheduled_at);
-CREATE INDEX idx_sessions_status    ON sessions(artist_id, status);
+CREATE INDEX idx_appointments_artist    ON appointments(artist_id);
+CREATE INDEX idx_appointments_contact   ON appointments(contact_id);
+CREATE INDEX idx_appointments_piece     ON appointments(piece_id);
+CREATE INDEX idx_appointments_scheduled ON appointments(artist_id, scheduled_at);
+CREATE INDEX idx_appointments_status    ON appointments(artist_id, status);
 
-CREATE TRIGGER sessions_updated_at
-  BEFORE UPDATE ON sessions
+CREATE TRIGGER appointments_updated_at
+  BEFORE UPDATE ON appointments
   FOR EACH ROW EXECUTE FUNCTION update_updated_at();
 
 -- ─────────────────────────────────────────────
--- enquiries — inbound enquiry tracking
--- ─────────────────────────────────────────────
-
-CREATE TABLE enquiries (
-  id                      UUID           PRIMARY KEY DEFAULT gen_random_uuid(),
-  artist_id               UUID           NOT NULL REFERENCES artists(id) ON DELETE CASCADE,
-  contact_id              UUID           NOT NULL REFERENCES contacts(id) ON DELETE CASCADE,
-  source                  enquiry_source NOT NULL DEFAULT 'manual',
-  message_text            TEXT,
-  received_at             TIMESTAMPTZ    NOT NULL DEFAULT NOW(),
-  status                  enquiry_status NOT NULL DEFAULT 'open',
-  converted_to_session_id UUID           REFERENCES sessions(id) ON DELETE SET NULL,
-  response_time_minutes   INTEGER,
-  created_at              TIMESTAMPTZ    NOT NULL DEFAULT NOW(),
-  updated_at              TIMESTAMPTZ    NOT NULL DEFAULT NOW()
-);
-
-CREATE INDEX idx_enquiries_artist  ON enquiries(artist_id);
-CREATE INDEX idx_enquiries_contact ON enquiries(contact_id);
-CREATE INDEX idx_enquiries_status  ON enquiries(artist_id, status);
-
-CREATE TRIGGER enquiries_updated_at
-  BEFORE UPDATE ON enquiries
-  FOR EACH ROW EXECUTE FUNCTION update_updated_at();
-
--- ─────────────────────────────────────────────
--- deposits
+-- deposits — manual record, NOT a payment integration. Sean confirms by eye.
+-- method is a label only (bank / stripe / cash) for the day a future artist
+-- takes money differently — no processing, no Stripe, no API.
 -- ─────────────────────────────────────────────
 
 CREATE TABLE deposits (
-  id           UUID           PRIMARY KEY DEFAULT gen_random_uuid(),
-  artist_id    UUID           NOT NULL REFERENCES artists(id) ON DELETE CASCADE,
-  contact_id   UUID           NOT NULL REFERENCES contacts(id) ON DELETE CASCADE,
-  session_id   UUID           REFERENCES sessions(id) ON DELETE SET NULL,
-  amount_pence INTEGER        NOT NULL,
-  status       deposit_status NOT NULL DEFAULT 'pending',
-  received_at  TIMESTAMPTZ,
-  notes        TEXT,
-  created_at   TIMESTAMPTZ    NOT NULL DEFAULT NOW(),
-  updated_at   TIMESTAMPTZ    NOT NULL DEFAULT NOW()
+  id             UUID           PRIMARY KEY DEFAULT gen_random_uuid(),
+  artist_id      UUID           NOT NULL REFERENCES artists(id) ON DELETE CASCADE,
+  appointment_id UUID           REFERENCES appointments(id) ON DELETE SET NULL,
+  amount         NUMERIC(10,2)  NOT NULL,
+  confirmed_at   TIMESTAMPTZ,   -- null = unconfirmed
+  confirmed_by   TEXT,
+  method         TEXT,          -- free-text label: 'bank' / 'stripe' / 'cash' / ...
+  created_at     TIMESTAMPTZ    NOT NULL DEFAULT NOW()
 );
 
-CREATE INDEX idx_deposits_artist  ON deposits(artist_id);
-CREATE INDEX idx_deposits_session ON deposits(session_id);
-
-CREATE TRIGGER deposits_updated_at
-  BEFORE UPDATE ON deposits
-  FOR EACH ROW EXECUTE FUNCTION update_updated_at();
+CREATE INDEX idx_deposits_artist      ON deposits(artist_id);
+CREATE INDEX idx_deposits_appointment ON deposits(appointment_id);
 
 -- ─────────────────────────────────────────────
--- messages — social intake skeleton (Step 6, modelled now)
+-- enquiries — bare stub so the foundation matches build-order step 1's named
+-- schema. Filled in by Packet 4. No tracking/conversion logic here.
 -- ─────────────────────────────────────────────
 
-CREATE TABLE messages (
-  id                   UUID              PRIMARY KEY DEFAULT gen_random_uuid(),
-  artist_id            UUID              NOT NULL REFERENCES artists(id) ON DELETE CASCADE,
-  contact_id           UUID              NOT NULL REFERENCES contacts(id) ON DELETE CASCADE,
-  instagram_message_id TEXT              UNIQUE,
-  direction            message_direction NOT NULL,
-  content              TEXT              NOT NULL,
-  sent_at              TIMESTAMPTZ       NOT NULL,
-  draft_reply          TEXT,
-  reply_status         reply_status      NOT NULL DEFAULT 'none',
-  created_at           TIMESTAMPTZ       NOT NULL DEFAULT NOW()
+CREATE TABLE enquiries (
+  id         UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
+  artist_id  UUID        NOT NULL REFERENCES artists(id) ON DELETE CASCADE,
+  contact_id UUID        NOT NULL REFERENCES contacts(id) ON DELETE CASCADE,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
-CREATE INDEX idx_messages_artist  ON messages(artist_id);
-CREATE INDEX idx_messages_contact ON messages(contact_id);
--- Partial index for the "pending approval" inbox
-CREATE INDEX idx_messages_drafts  ON messages(artist_id) WHERE reply_status = 'drafted';
+CREATE INDEX idx_enquiries_artist ON enquiries(artist_id);
 
 -- ─────────────────────────────────────────────
--- Row Level Security
--- Every artist sees exactly their own data. artist_id = auth.uid() on all tables.
+-- Row Level Security — real RLS, enforced now.
+-- Every policy keys on artist_id = current_artist_id() (the JWT app_metadata claim),
+-- so an artist can only ever see/write their own rows.
 -- ─────────────────────────────────────────────
 
-ALTER TABLE artists   ENABLE ROW LEVEL SECURITY;
-ALTER TABLE contacts  ENABLE ROW LEVEL SECURITY;
-ALTER TABLE pieces    ENABLE ROW LEVEL SECURITY;
-ALTER TABLE sessions  ENABLE ROW LEVEL SECURITY;
-ALTER TABLE enquiries ENABLE ROW LEVEL SECURITY;
-ALTER TABLE deposits  ENABLE ROW LEVEL SECURITY;
-ALTER TABLE messages  ENABLE ROW LEVEL SECURITY;
+ALTER TABLE artists      ENABLE ROW LEVEL SECURITY;
+ALTER TABLE blocklist    ENABLE ROW LEVEL SECURITY;
+ALTER TABLE contacts     ENABLE ROW LEVEL SECURITY;
+ALTER TABLE pieces       ENABLE ROW LEVEL SECURITY;
+ALTER TABLE appointments ENABLE ROW LEVEL SECURITY;
+ALTER TABLE deposits     ENABLE ROW LEVEL SECURITY;
+ALTER TABLE enquiries    ENABLE ROW LEVEL SECURITY;
 
-CREATE POLICY "artists_select_own" ON artists FOR SELECT USING (auth.uid() = id);
-CREATE POLICY "artists_insert_own" ON artists FOR INSERT WITH CHECK (auth.uid() = id);
-CREATE POLICY "artists_update_own" ON artists FOR UPDATE USING (auth.uid() = id) WITH CHECK (auth.uid() = id);
+CREATE POLICY "artists_tenant_isolation" ON artists
+  USING (id = current_artist_id()) WITH CHECK (id = current_artist_id());
 
-CREATE POLICY "contacts_all_own"  ON contacts  USING (artist_id = auth.uid()) WITH CHECK (artist_id = auth.uid());
-CREATE POLICY "pieces_all_own"    ON pieces    USING (artist_id = auth.uid()) WITH CHECK (artist_id = auth.uid());
-CREATE POLICY "sessions_all_own"  ON sessions  USING (artist_id = auth.uid()) WITH CHECK (artist_id = auth.uid());
-CREATE POLICY "enquiries_all_own" ON enquiries USING (artist_id = auth.uid()) WITH CHECK (artist_id = auth.uid());
-CREATE POLICY "deposits_all_own"  ON deposits  USING (artist_id = auth.uid()) WITH CHECK (artist_id = auth.uid());
-CREATE POLICY "messages_all_own"  ON messages  USING (artist_id = auth.uid()) WITH CHECK (artist_id = auth.uid());
+CREATE POLICY "blocklist_tenant_isolation" ON blocklist
+  USING (artist_id = current_artist_id()) WITH CHECK (artist_id = current_artist_id());
+
+CREATE POLICY "contacts_tenant_isolation" ON contacts
+  USING (artist_id = current_artist_id()) WITH CHECK (artist_id = current_artist_id());
+
+CREATE POLICY "pieces_tenant_isolation" ON pieces
+  USING (artist_id = current_artist_id()) WITH CHECK (artist_id = current_artist_id());
+
+CREATE POLICY "appointments_tenant_isolation" ON appointments
+  USING (artist_id = current_artist_id()) WITH CHECK (artist_id = current_artist_id());
+
+CREATE POLICY "deposits_tenant_isolation" ON deposits
+  USING (artist_id = current_artist_id()) WITH CHECK (artist_id = current_artist_id());
+
+CREATE POLICY "enquiries_tenant_isolation" ON enquiries
+  USING (artist_id = current_artist_id()) WITH CHECK (artist_id = current_artist_id());
 
 -- ─────────────────────────────────────────────
--- unfinished_pieces view (Build Order Step 2)
--- security_invoker=on: RLS on the underlying tables still applies,
--- so each artist only ever sees their own rows.
---
--- A contact appears here when:
---   1. They have a multi-session piece still in_progress
---   2. That piece has at least one completed session
---   3. That piece has NO future confirmed/pending sessions
+-- Seed: one artists row for Sean so Packets 2-3 have something to run against.
+-- PLACEHOLDER — update name/config once Sean's details are confirmed.
 -- ─────────────────────────────────────────────
 
-CREATE VIEW unfinished_pieces WITH (security_invoker = on) AS
-SELECT
-  c.id                AS contact_id,
-  c.artist_id,
-  c.name              AS contact_name,
-  c.instagram_user_id,
-  c.category,
-  p.id                AS piece_id,
-  p.title             AS piece_title,
-  p.description       AS piece_description,
-  COUNT(s.id)         AS sessions_completed,
-  MAX(s.scheduled_at) AS last_session_at
-FROM contacts c
-JOIN pieces p
-  ON  p.contact_id     = c.id
-  AND p.is_multi_session = TRUE
-  AND p.status           = 'in_progress'
-JOIN sessions s
-  ON  s.piece_id = p.id
-  AND s.status   = 'completed'
-WHERE c.do_not_engage = FALSE
-  AND NOT EXISTS (
-    SELECT 1
-    FROM sessions s2
-    WHERE s2.piece_id = p.id
-      AND s2.scheduled_at > NOW()
-      AND s2.status NOT IN ('cancelled', 'no_show')
-  )
-GROUP BY
-  c.id, c.artist_id, c.name, c.instagram_user_id, c.category,
-  p.id, p.title, p.description
-ORDER BY last_session_at DESC;
+INSERT INTO artists (name, voice_tone_profile, working_hours, deposit_rules)
+VALUES ('Sean', '{}', '{}', '{}');
